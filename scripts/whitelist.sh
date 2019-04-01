@@ -1,39 +1,48 @@
 #!/bin/bash
-# This script will download and add domains from the rep to whitelist.txt file.
 # Project homepage: https://github.com/anudeepND/whitelist
 # Licence: https://github.com/anudeepND/whitelist/blob/master/LICENSE
-# Created by Anudeep (Slight change by cminion)
+# Created by Anudeep (Personal fork by Ming)
 #================================================================================
-TICK="[\e[32m ✔ \e[0m]"
-PIHOLE_LOCATION="/etc/pihole"
+set -e          # Exit on error.
+export LC_ALL=C # Force consistent sort order.
 
-if [ -r config.cfg ]; then
-  echo "Reading user config...." >&2
-  source config.cfg
+readonly PIHOLE_DIR='/etc/pihole'
+readonly PIHOLE_COMMAND='/usr/local/bin/pihole'
+
+readonly URLS=$(
+	curl -fsS 'https://api.github.com/repos/anudeepND/whitelist/contents/domains' |
+		jq -r '.[].download_url'
+)
+readonly FILE="${PIHOLE_DIR}/whitelist.txt"
+readonly LOG='/var/log/pihole_whitelist.log'
+
+# Remove comments and empty lines.
+function compact() {
+	grep -vE '^(#|$)' "$@"
+}
+
+readonly downloaded=$(mktemp)
+trap 'rm "${downloaded}"' EXIT
+
+for url in ${URLS}; do
+	echo "# ${url}"
+	curl -fsSL "${url}" | compact
+done | sort -u >>"${downloaded}"
+
+if [[ -e "${FILE}" ]]; then
+	# Append custom entries, i.e. those in ${FILE} that are not in ${downloaded}.
+	readonly custom=$(comm -23 <(compact "${FILE}" | sort -u) "${downloaded}")
+	if [[ "${custom}" ]]; then
+		echo -e "\\n# Custom whitelist:\\n${custom}" >>"${downloaded}"
+	fi
+
+	# Backup ${FILE} if the whitelist has changed.
+	if ! cmp -s <(tail -n+2 "${FILE}" | head -n-1) "${downloaded}"; then
+		mv "${FILE}" "${FILE}.old"
+	fi
 fi
+echo -e "# Whitelist sources (updated $(date -R)):\\n$(<"${downloaded}")\\n" >"${FILE}"
 
-echo -e " \e[1m This script will download and add domains from the repo to whitelist.txt \e[0m"
-sleep 0.1
-echo -e "\n"
-
-if [ "$(id -u)" != "0" ] ; then
-	echo "This script requires root permissions. Please run this as root!"
-	exit 2
-fi
-
-curl -sS https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt | sudo tee -a "${PIHOLE_LOCATION}"/whitelist.txt >/dev/null
-echo -e " ${TICK} \e[32m Adding to whitelist... \e[0m"
-sleep 0.1
-echo -e " ${TICK} \e[32m Removing duplicates... \e[0m"
-mv "${PIHOLE_LOCATION}"/whitelist.txt "${PIHOLE_LOCATION}"/whitelist.txt.old && cat "${PIHOLE_LOCATION}"/whitelist.txt.old | sort | uniq >> "${PIHOLE_LOCATION}"/whitelist.txt
-
-echo -e " [...] \e[32m Pi-hole gravity rebuilding lists. This may take a while... \e[0m"
-"${DOCKER_EXEC}" pihole -g > /dev/null
- 
-echo -e " ${TICK} \e[32m Pi-hole's gravity updated \e[0m"
-echo -e " ${TICK} \e[32m Done! \e[0m"
-
-
-echo -e " \e[1m  Star me on GitHub, https://github.com/anudeepND/whitelist \e[0m"
-echo -e " \e[1m  Happy AdBlocking :)\e[0m"
-echo -e "\n\n"
+# Squash output to log, then splat the log to stdout on error to allow for
+# standard crontab job error handling (credit: pihole.cron).
+"${PIHOLE_COMMAND}" updateGravity --skip-download --whitelist-only >"${LOG}" || cat "${LOG}"
